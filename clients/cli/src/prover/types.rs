@@ -29,6 +29,12 @@ pub enum ProverError {
 
     #[error("Task Join Error: {0}")]
     JoinError(JoinError),
+
+    #[error("Task was explicitly cancelled")]
+    Cancelled, 
+
+    #[error("Internal prover error: {0}")]
+    Internal(String), 
 }
 
 /// Result of a proof generation, including combined hash for multiple inputs

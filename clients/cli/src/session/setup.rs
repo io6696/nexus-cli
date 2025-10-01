@@ -8,7 +8,7 @@ use crate::orchestrator::OrchestratorClient;
 use crate::runtime::start_authenticated_worker;
 use ed25519_dalek::SigningKey;
 use std::error::Error;
-use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
+use sysinfo::System;
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
 
@@ -31,31 +31,20 @@ pub struct SessionData {
     pub num_workers: usize,
 }
 
-/// Warn the user if their available memory seems insufficient for the task(s) at hand
-pub fn warn_memory_configuration(max_threads: Option<u32>) {
-    if let Some(threads) = max_threads {
-        let current_pid = Pid::from(std::process::id() as usize);
+/// Clamp the max-threads param by total logical cores and system memory.
+pub fn clamp_threads(requested_threads: usize) -> usize {
+    let mut sysinfo = System::new();
+    sysinfo.refresh_memory();
 
-        let mut sysinfo = System::new();
-        sysinfo.refresh_processes_specifics(
-            ProcessesToUpdate::Some(&[current_pid]),
-            true, // Refresh exact processes
-            ProcessRefreshKind::nothing().with_memory(),
-        );
-
-        if let Some(process) = sysinfo.process(current_pid) {
-            let ram_total = process.memory();
-            if threads as u64 * crate::consts::cli_consts::PROJECTED_MEMORY_REQUIREMENT >= ram_total
-            {
-                crate::print_cmd_warn!(
-                    "OOM warning",
-                    "Projected memory usage across {} requested threads exceeds memory currently available to process. In the event that proving fails due to an out-of-memory error, please restart the Nexus CLI with a smaller value supplied to `--max-threads`.",
-                    threads
-                );
-                std::thread::sleep(std::time::Duration::from_secs(3));
-            }
-        }
-    }
+    let total_system_memory: u64 = sysinfo.total_memory();
+    
+    let required_memory_per_thread: u64 = crate::consts::cli_consts::PROJECTED_MEMORY_REQUIREMENT;
+    let max_threads_by_memory_u64 = total_system_memory / required_memory_per_thread;
+    let memory_limit_usize = (max_threads_by_memory_u64.saturating_sub(1) as usize).max(1);
+    
+    let core_count = crate::system::num_cores();
+    let absolute_max_threads = memory_limit_usize.min(core_count);
+    return requested_threads.clamp(1, absolute_max_threads) as usize;
 }
 
 /// Sets up an authenticated worker session
@@ -78,7 +67,7 @@ pub fn warn_memory_configuration(max_threads: Option<u32>) {
 pub async fn setup_session(
     config: Config,
     env: Environment,
-    check_mem: bool,
+    _check_mem: bool,
     max_threads: Option<u32>,
     max_tasks: Option<u32>,
     max_difficulty: Option<crate::nexus_orchestrator::TaskDifficulty>,
@@ -94,12 +83,12 @@ pub async fn setup_session(
     let orchestrator_client = OrchestratorClient::new(env.clone());
 
     // Warn the user if the memory demands of their configuration is risky
-    if check_mem {
-        warn_memory_configuration(max_threads);
-    }
+    // if check_mem {
+    //     warn_memory_configuration(max_threads);
+    // }
 
     // Clamp the number of workers to [1,8]. Keep this low for now to avoid rate limiting.
-    let num_workers: usize = max_threads.unwrap_or(1).clamp(1, 8) as usize;
+    let num_workers: usize = clamp_threads(max_threads.unwrap_or(1) as usize);
 
     // Create shutdown channel - only one shutdown signal needed
     let (shutdown_sender, _) = broadcast::channel(1);

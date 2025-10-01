@@ -14,14 +14,14 @@ pub fn print_info(title: &str, details: &str) {
 }
 
 /// Print CLI command warn message
-pub fn print_warn(title: &str, details: &str) {
-    print!("\x1b[1;91m[WARN]\x1b[0m {}", title);
-    if !details.is_empty() {
-        println!("\t {}", details);
-    } else {
-        println!();
-    }
-}
+// pub fn print_warn(title: &str, details: &str) {
+//     print!("\x1b[1;91m[WARN]\x1b[0m {}", title);
+//     if !details.is_empty() {
+//         println!("\t {}", details);
+//     } else {
+//         println!();
+//     }
+// }
 
 /// Print CLI command error
 pub fn print_error(title: &str, details: Option<&str>) {

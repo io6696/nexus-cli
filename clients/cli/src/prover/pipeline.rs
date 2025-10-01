@@ -1,6 +1,9 @@
 //! Proving pipeline that orchestrates the full proving process
 
+use futures::future::join_all;
 use std::sync::Arc;
+use tokio::sync::Semaphore;
+use tokio_util::sync::CancellationToken; // Import for join_all
 
 use super::engine::ProvingEngine;
 use super::input::InputParser;
@@ -48,72 +51,168 @@ impl ProvingPipeline {
             ));
         }
 
-        let mut proof_hashes = Vec::new();
-        let mut all_proofs: Vec<Proof> = Vec::new();
-        let mut handles = Vec::new();
+        // Shared references for concurrent access
+        let task_shared = Arc::new(task.clone());
+        let environment_shared = Arc::new(environment.clone());
+        let client_id_shared = Arc::new(client_id.to_string());
 
-        // Create a semaphore with a specific number of permits
-        let semaphore = Arc::new(tokio::sync::Semaphore::new(num_workers));
+        let semaphore = Arc::new(Semaphore::new(num_workers));
+        let cancellation_token = CancellationToken::new();
 
-        for (input_index, input_data) in all_inputs.iter().enumerate() {
-            let task_clone = task.clone();
-            let environment_clone = environment.clone();
-            let client_id_clone = client_id.to_string();
-            let input_data_clone = input_data.clone();
-            let input_index_clone = input_index;
-            let semaphore_clone = Arc::clone(&semaphore);
+        let handles: Vec<_> = all_inputs
+            .iter()
+            .enumerate()
+            .map(|(input_index, input_data)| {
+                let task_ref = Arc::clone(&task_shared);
+                let environment_ref = Arc::clone(&environment_shared);
+                let client_id_ref = Arc::clone(&client_id_shared);
+                let input_data = input_data.clone();
+                let semaphore_ref = Arc::clone(&semaphore);
+                let cancellation_ref = cancellation_token.clone();
 
-            let handle = tokio::spawn(async move {
-                // Acquire a permit from the semaphore. This waits if the limit is reached.
-                let _permit = semaphore_clone.acquire_owned().await;
+                tokio::spawn(async move {
+                    // Return type is Result<(Proof, String, usize), ProverError>
 
-                // Step 1: Parse and validate input
-                let inputs = InputParser::parse_triple_input(&input_data_clone)?;
-
-                // Step 2: Generate and verify proof
-                let proof = ProvingEngine::prove_and_validate(
-                    &inputs,
-                    &task_clone,
-                    &environment_clone,
-                    &client_id_clone,
-                )
-                .await
-                .map_err(|e| match e {
-                    ProverError::Stwo(_) | ProverError::GuestProgram(_) => {
-                        let error_msg = format!("Input {}: {}", input_index_clone, e);
-                        tokio::spawn(track_verification_failed(
-                            task_clone.clone(),
-                            error_msg.clone(),
-                            environment_clone.clone(),
-                            client_id_clone.to_string(),
-                        ));
-                        e
+                    if cancellation_ref.is_cancelled() {
+                        return Err(ProverError::Cancelled);
                     }
-                    _ => e,
-                })?;
 
-                // Step 3: Generate proof hash
-                let proof_hash = Self::generate_proof_hash(&proof);
+                    // Acquire permit: limits active workers to num_workers
+                    let _permit = semaphore_ref.acquire_owned().await.map_err(|_| {
+                        ProverError::Internal("Worker semaphore closed".to_string())
+                    })?;
 
-                Ok((proof, proof_hash))
-            });
-            handles.push(handle);
-        }
+                    if cancellation_ref.is_cancelled() {
+                        return Err(ProverError::Cancelled);
+                    }
 
-        // Collect the results from the spawned tasks
-        for handle in handles {
-            match handle.await {
-                Ok(result) => match result {
-                    Ok((proof, proof_hash)) => {
+                    // Step 1: Parse and validate input (embed index in error)
+                    let inputs = InputParser::parse_triple_input(&input_data).map_err(|e| {
+                        ProverError::MalformedTask(format!(
+                            "Input {}: Parsing failed: {}",
+                            input_index, e
+                        ))
+                    })?;
+
+                    // Step 2: Generate and verify proof (embed index in error)
+                    let proof = ProvingEngine::prove_and_validate(
+                        &inputs,
+                        &task_ref,
+                        &environment_ref,
+                        &client_id_ref,
+                    )
+                    .await
+                    .map_err(|e| {
+                        ProverError::Stwo(format!(
+                            "Input {}: Proof validation failed: {}",
+                            input_index, e
+                        ))
+                    })?;
+
+                    // Step 3: Generate proof hash
+                    let proof_hash = Self::generate_proof_hash(&proof);
+
+                    Ok((proof, proof_hash, input_index))
+                })
+            })
+            .collect();
+
+        // Await all spawned tasks concurrently
+        let results = join_all(handles).await;
+
+        let mut all_proofs = Vec::new();
+        let mut proof_hashes = Vec::new();
+        let mut verification_failures = Vec::new();
+
+        for result in results {
+            match result {
+                Ok(inner_result) => match inner_result {
+                    // Task succeeded
+                    Ok((proof, proof_hash, _input_index)) => {
                         all_proofs.push(proof);
                         proof_hashes.push(proof_hash);
                     }
-                    Err(e) => return Err(e),
+                    // Task failed with a ProverError
+                    Err(e) => {
+                        match e {
+                            ProverError::Stwo(indexed_e) => {
+                                let separator = ": ";
+                                if let Some((index_part, error_msg)) =
+                                    indexed_e.split_once(separator)
+                                {
+                                    let input_index = index_part
+                                        .trim_start_matches("Input ")
+                                        .parse::<usize>()
+                                        .unwrap_or(0);
+
+                                    verification_failures.push((
+                                        task_shared.clone(),
+                                        format!("Input {}: {}", input_index, error_msg),
+                                        environment_shared.clone(),
+                                        client_id_shared.clone(),
+                                    ));
+                                } else {
+                                    cancellation_token.cancel();
+                                    return Err(ProverError::Stwo(indexed_e));
+                                }
+                            }
+                            ProverError::GuestProgram(indexed_e) => {
+                                let separator = ": ";
+                                if let Some((index_part, error_msg)) =
+                                    indexed_e.split_once(separator)
+                                {
+                                    let input_index = index_part
+                                        .trim_start_matches("Input ")
+                                        .parse::<usize>()
+                                        .unwrap_or(0);
+
+                                    verification_failures.push((
+                                        task_shared.clone(),
+                                        format!("Input {}: {}", input_index, error_msg),
+                                        environment_shared.clone(),
+                                        client_id_shared.clone(),
+                                    ));
+                                } else {
+                                    cancellation_token.cancel();
+                                    return Err(ProverError::GuestProgram(indexed_e));
+                                }
+                            }
+                            ProverError::Cancelled => {
+                                continue;
+                            }
+                            _ => {
+                                // Critical, non-recoverable error
+                                cancellation_token.cancel();
+                                return Err(e);
+                            }
+                        }
+                    }
                 },
-                Err(e) => {
-                    return Err(ProverError::JoinError(e));
+                // Task panicked or failed to join
+                Err(join_error) => {
+                    cancellation_token.cancel();
+                    return Err(ProverError::JoinError(join_error));
                 }
             }
+        }
+
+        // Handle all verification failures in batch
+        let failure_count = verification_failures.len();
+        for (task, error_msg, env, client) in verification_failures {
+            tokio::spawn(track_verification_failed(
+                (*task).clone(),
+                error_msg,
+                (*env).clone(),
+                (*client).clone(),
+            ));
+        }
+
+        // Return final error if any verification failed
+        if failure_count > 0 {
+            return Err(ProverError::MalformedTask(format!(
+                "{} inputs failed verification",
+                failure_count
+            )));
         }
 
         let final_proof_hash = Self::combine_proof_hashes(task, &proof_hashes);
